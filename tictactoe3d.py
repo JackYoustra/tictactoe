@@ -8,7 +8,7 @@ from enum import Enum, auto
 from typing import List, Set, Optional, Tuple, Union
 import numpy as np
 import numpy.typing as npt
-from numba import cuda, uint64, int32
+from numba import cuda, uint64, int32 # type: ignore
 import math
 
 class GameResult(Enum):
@@ -140,8 +140,8 @@ class WinPatternGenerator:
         return patterns
 
 @cuda.jit(device=True)
-def check_pattern_match(board_bits: uint64[:], pattern_bits: uint64[:], 
-                       n_u64s: int32) -> bool:
+def check_pattern_match(board_bits: uint64[:], pattern_bits: uint64[:],  # type: ignore
+                       n_u64s: int32) -> bool: # type: ignore
     """Device function to check if a pattern matches a board position"""
     for i in range(n_u64s):
         if pattern_bits[i] and (board_bits[i] & pattern_bits[i]) != pattern_bits[i]:
@@ -150,7 +150,7 @@ def check_pattern_match(board_bits: uint64[:], pattern_bits: uint64[:],
 
 @cuda.jit
 def evaluate_boards_kernel(boards_p1, boards_p2, results, patterns, 
-                         n_patterns: int32, n_u64s: int32):
+                         n_patterns: int32, n_u64s: int32): # type: ignore
     """CUDA kernel for board evaluation"""
     idx = cuda.grid(1)
     if idx >= boards_p1.shape[0]:
