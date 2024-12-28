@@ -54,15 +54,18 @@ def valid_game_states(draw):
     return config, board_p1, board_p2
 
 class TestGameConfig:
+    @pytest.mark.timeout(5)
     def test_valid_config(self):
         config = GameConfig(size=3, target=3)
         assert config.size == 3
         assert config.target == 3
 
+    @pytest.mark.timeout(5)
     def test_invalid_size(self):
         with pytest.raises(AssertionError):
             GameConfig(size=2, target=3)
 
+    @pytest.mark.timeout(5)
     def test_invalid_target(self):
         with pytest.raises(AssertionError):
             GameConfig(size=3, target=4)
@@ -72,23 +75,27 @@ class TestBitBoard:
     def config_3x3(self):
         return GameConfig(size=3, target=3)
 
+    @pytest.mark.timeout(5)
     def test_initialization(self, config_3x3):
         board = BitBoard(config_3x3)
         assert board.is_empty()
         assert board.count_bits() == 0
 
+    @pytest.mark.timeout(5)
     def test_set_get_bit(self, config_3x3):
         board = BitBoard(config_3x3)
         board.set_bit(0, 0, 0)
         assert board.get_bit(0, 0, 0)
         assert not board.get_bit(0, 0, 1)
 
+    @pytest.mark.timeout(5)
     def test_clear_bit(self, config_3x3):
         board = BitBoard(config_3x3)
         board.set_bit(0, 0, 0)
         board.clear_bit(0, 0, 0)
         assert not board.get_bit(0, 0, 0)
 
+    @pytest.mark.timeout(5)
     def test_bitwise_operations(self, config_3x3):
         board1 = BitBoard(config_3x3)
         board2 = BitBoard(config_3x3)
@@ -105,6 +112,7 @@ class TestWinPatternGenerator:
     def generator_3x3(self):
         return WinPatternGenerator(GameConfig(size=3, target=3))
 
+    @pytest.mark.timeout(5)
     def test_pattern_generation(self, generator_3x3):
         patterns = generator_3x3.generate_all_patterns()
         assert len(patterns) > 0
@@ -114,6 +122,7 @@ class TestWinPatternGenerator:
         assert pattern is not None
         assert pattern.count_bits() == 3
 
+    @pytest.mark.timeout(5)
     def test_invalid_pattern(self, generator_3x3):
         # Test pattern that goes out of bounds
         pattern = generator_3x3.generate_pattern(2, 2, 2, 1, 0, 0)
@@ -124,13 +133,15 @@ class TestTicTacToe3D:
     def game_3x3(self):
         return TicTacToe3D(GameConfig(size=3, target=3))
 
+    @pytest.mark.timeout(5)
     def test_initialization(self, game_3x3):
         assert game_3x3.current_player == 1
         assert game_3x3.board_p1.is_empty()
         assert game_3x3.board_p2.is_empty()
 
+    @pytest.mark.timeout(5)
     @given(valid_game_states())
-    @settings(deadline=None) 
+    @settings(deadline=None)
     def test_evaluation_consistency(self, game_state):
         config, board_p1, board_p2 = game_state
         game = TicTacToe3D(config)
@@ -139,6 +150,7 @@ class TestTicTacToe3D:
         result2 = game.evaluate_batch([board_p1], [board_p2])[0]
         assert result1 == result2
 
+    @pytest.mark.timeout(5)
     def test_horizontal_win(self, game_3x3):
         # Make horizontal winning line
         game_3x3.make_move(0, 0, 0)
@@ -149,12 +161,14 @@ class TestTicTacToe3D:
         
         assert game_3x3.get_game_state() == GameResult.WIN
 
+    @pytest.mark.timeout(5)
     def test_valid_moves(self, game_3x3):
         game_3x3.make_move(0, 0, 0)
         moves = game_3x3.get_valid_moves(game_3x3.board_p1, game_3x3.board_p2)
         assert len(moves) == game_3x3.size ** 3 - 1
         assert (0, 0, 0) not in moves
 
+    @pytest.mark.timeout(5)
     @pytest.mark.benchmark(
         group="perfect_play",
         min_rounds=1,  # This is a deep test, so one round is sufficient
@@ -207,6 +221,7 @@ class TestPerformance:
         
         return boards_p1, boards_p2
 
+    @pytest.mark.timeout(5)
     def run_performance_test(self, benchmark, test_name: str, test_fn, 
                            test_args: dict, iterations: int,
                            improvement_threshold: float = 0.9) -> None:
@@ -266,6 +281,7 @@ class TestPerformance:
         
         return result
 
+    @pytest.mark.timeout(5)
     @pytest.mark.benchmark(
         group="cuda",
         min_rounds=10,
@@ -294,6 +310,7 @@ class TestPerformance:
         assert len(eval_result) == len(boards_p1)
         assert all(isinstance(r, np.int32) for r in eval_result)
 
+    @pytest.mark.timeout(5)
     @pytest.mark.benchmark(
         group="minimax",
         min_rounds=5,  # Fewer rounds since move generation is slower

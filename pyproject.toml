@@ -19,7 +19,6 @@ dev-dependencies = [
 ]
 
 [tool.pytest.ini_options]
-timeout = 5  # Global timeout of 5 seconds for all tests
 markers = [
     "benchmark: marks tests as benchmarks",
     "timeout: marks timeout for tests",
