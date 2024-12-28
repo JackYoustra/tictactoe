@@ -4,5 +4,11 @@
     "stddev": 5.904187543739975e-05,
     "rounds": 1089,
     "iterations": 1024
+  },
+  "move_generation": {
+    "mean": 5.010581305999949,
+    "stddev": 0.003864395128546259,
+    "rounds": 2,
+    "iterations": 1
   }
 }

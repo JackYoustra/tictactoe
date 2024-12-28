@@ -235,5 +235,77 @@ class TestPerformance:
         assert len(eval_result) == len(boards_p1)
         assert all(isinstance(r, np.int32) for r in eval_result)
 
+    @pytest.mark.benchmark(
+        group="minimax",
+        min_rounds=2,  # Fewer rounds since move generation is slower
+        warmup=True,
+        warmup_iterations=1
+    )
+    def test_move_generation_performance(self, benchmark, sample_boards):
+        """Benchmark move generation performance with regression detection"""
+        boards_p1, boards_p2 = sample_boards
+        game = TicTacToe3D(GameConfig(size=4, target=4))
+        
+        # Take a subset of boards for move generation since it's slower
+        test_positions = 1
+        boards_p1 = boards_p1[:test_positions]
+        boards_p2 = boards_p2[:test_positions]
+        
+        def run_move_generation():
+            moves = []
+            for b1, b2 in zip(boards_p1, boards_p2):
+                game.board_p1 = b1
+                game.board_p2 = b2
+                moves.append(game.get_best_move(depth=3))
+            return moves
+        
+        # Run benchmark and get result
+        move_result = benchmark(run_move_generation)
+        
+        # Store performance metrics
+        snapshot_file = Path("performance_snapshots.json")
+        current_stats = {
+            "mean": float(benchmark.stats["mean"]),
+            "stddev": float(benchmark.stats["stddev"]),
+            "rounds": int(benchmark.stats["rounds"]),
+            "iterations": test_positions
+        }
+        
+        if snapshot_file.exists():
+            data = json.loads(snapshot_file.read_text())
+        else:
+            data = {}
+        
+        if "move_generation" not in data:
+            print("\nFirst run - storing baseline move generation metrics:")
+            print(f"Mean time: {current_stats['mean']:.6f} seconds")
+            print(f"Std dev:   {current_stats['stddev']:.6f} seconds")
+            data["move_generation"] = current_stats
+            snapshot_file.write_text(json.dumps(data, indent=2))
+        else:
+            baseline = data["move_generation"]
+            
+            # Compare with baseline
+            regression_threshold = 1.2  # 20% regression threshold
+            percent_change = ((current_stats["mean"] - baseline["mean"]) / baseline["mean"]) * 100
+            
+            print(f"\nMove Generation Performance comparison:")
+            print(f"Baseline mean: {baseline['mean']:.6f} seconds")
+            print(f"Current mean:  {current_stats['mean']:.6f} seconds")
+            print(f"Change:        {percent_change:+.2f}%")
+            
+            # Fail if regression is above threshold
+            assert current_stats["mean"] <= baseline["mean"] * regression_threshold, \
+                f"Performance regression detected: {percent_change:.1f}% slower than baseline"
+        
+        # Verify correctness of the actual computation result
+        assert len(move_result) == test_positions
+        # Each result should be None or a valid move tuple
+        for move in move_result:
+            if move is not None:
+                assert len(move) == 3
+                assert all(isinstance(x, int) for x in move)
+                assert all(0 <= x < 4 for x in move)
+
 if __name__ == "__main__":
     pytest.main([__file__])
