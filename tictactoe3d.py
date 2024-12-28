@@ -19,6 +19,10 @@ from rich.text import Text
 from rich.console import Console
 from collections import deque
 from statistics import mean
+import argparse
+import cProfile
+import pstats
+from pstats import SortKey
 
 # Constants for CUDA optimization
 WARP_SIZE = 32
@@ -308,6 +312,16 @@ class TicTacToe3D:
         result = self.evaluate_batch([self.board_p1], [self.board_p2])[0]
         return GameResult(result)
     
+    def heuristic(self, board_p1: BitBoard, board_p2: BitBoard) -> float:
+        """Heuristic evaluation function"""
+        # Use CUDA-accelerated batch evaluation for patterns
+        boards_p1 = [board_p1] * len(self.patterns)
+        boards_p2 = [board_p2] * len(self.patterns)
+        
+        # Evaluate all patterns at once
+        pattern_scores = self.evaluate_batch(boards_p1, boards_p2)
+        return float(np.mean(pattern_scores))
+    
     def minimax(self, board_p1: BitBoard, board_p2: BitBoard, depth: int,
                 alpha: float = float('-inf'), beta: float = float('inf'),
                 maximizing: bool = True) -> Tuple[float, Optional[Tuple[int, int, int]]]:
@@ -329,26 +343,17 @@ class TicTacToe3D:
         
         # Create reusable BitBoard objects for move simulation
         temp_board = BitBoard(self.config)
-        
-        # Score moves for better ordering
-        move_scores = []
-        for move in moves:
-            temp_board.bits = board_p1.bits.copy() if maximizing else board_p2.bits.copy()
-            temp_board.set_bit(*move)
-            score = self.heuristic(temp_board if maximizing else board_p1,
-                                 board_p2 if maximizing else temp_board)
-            move_scores.append((score, move))
-        
-        # Sort moves by score (descending for maximizing, ascending for minimizing)
-        move_scores.sort(reverse=maximizing)
-        moves = [move for _, move in move_scores]
-        
         best_move = None
+        
+        # Simple move ordering heuristic - center and middle layers first
+        mid = self.size // 2
+        moves.sort(key=lambda m: -(abs(m[0] - mid) + abs(m[1] - mid) + abs(m[2] - mid)))
+        
         if maximizing:
             max_eval = float('-inf')
             for move in moves:
-                # Reuse BitBoard object
-                temp_board.bits = board_p1.bits.copy()
+                # Reuse BitBoard object and copy bits
+                temp_board.bits[:] = board_p1.bits
                 temp_board.set_bit(*move)
                 
                 eval, _ = self.minimax(temp_board, board_p2, depth-1, alpha, beta, False)
@@ -363,8 +368,8 @@ class TicTacToe3D:
         else:
             min_eval = float('inf')
             for move in moves:
-                # Reuse BitBoard object
-                temp_board.bits = board_p2.bits.copy()
+                # Reuse BitBoard object and copy bits
+                temp_board.bits[:] = board_p2.bits
                 temp_board.set_bit(*move)
                 
                 eval, _ = self.minimax(board_p1, temp_board, depth-1, alpha, beta, True)
@@ -376,35 +381,6 @@ class TicTacToe3D:
                 if beta <= alpha:
                     break
             return min_eval, best_move
-    
-    def heuristic(self, board_p1: BitBoard, board_p2: BitBoard) -> float:
-        """Heuristic evaluation function"""
-        # Count number of potential winning lines
-        score = 0.0
-        for pattern in self.patterns:
-            p1_match = True
-            p2_match = True
-            p1_count = 0
-            p2_count = 0
-            
-            for i in range(self.num_u64s):
-                if pattern.bits[i]:
-                    if board_p2.bits[i] & pattern.bits[i]:
-                        p1_match = False
-                    elif board_p1.bits[i] & pattern.bits[i]:
-                        p1_count += bin(board_p1.bits[i] & pattern.bits[i]).count('1')
-                    
-                    if board_p1.bits[i] & pattern.bits[i]:
-                        p2_match = False
-                    elif board_p2.bits[i] & pattern.bits[i]:
-                        p2_count += bin(board_p2.bits[i] & pattern.bits[i]).count('1')
-            
-            if p1_match:
-                score += p1_count / self.config.target
-            if p2_match:
-                score -= p2_count / self.config.target
-        
-        return score / len(self.patterns)  # Normalize by number of patterns
     
     def get_best_move(self, depth: int = 4) -> Optional[Tuple[int, int, int]]:
         """Get best move using minimax with parallel evaluation"""
@@ -477,8 +453,17 @@ def create_stats_panel(moves_per_sec: float, evals_per_sec: float,
 
 def main():
     """Self-playing game with performance metrics"""
-    # Create a 4x4x4 game where you need 4 in a row to win
-    config = GameConfig(size=3, target=3)
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='3D Tic-Tac-Toe with optional profiling')
+    parser.add_argument('--profile', action='store_true', help='Enable profiling')
+    parser.add_argument('--depth', type=int, default=4, help='Search depth for AI (default: 4)')
+    parser.add_argument('--moves', type=int, default=None, help='Number of moves to profile (default: unlimited)')
+    parser.add_argument('--size', type=int, default=3, help='Board size (default: 3)')
+    parser.add_argument('--target', type=int, default=3, help='Target in a row to win (default: 3)')
+    args = parser.parse_args()
+
+    # Create game instance
+    config = GameConfig(size=args.size, target=args.target)
     game = TicTacToe3D(config)
     
     # Performance tracking
@@ -495,8 +480,17 @@ def main():
         Layout(name="stats", ratio=1)
     )
     
+    # Set up profiling if enabled
+    profiler = cProfile.Profile() if args.profile else None
+    if args.profile:
+        profiler.enable()
+    
     with Live(layout, refresh_per_second=4) as live:
         while True:
+            # Check move limit for profiling
+            if args.moves is not None and total_moves >= args.moves:
+                break
+                
             # Update board display
             layout["board"].update(Panel(create_board_table(game), title="3D Tic-Tac-Toe"))
             
@@ -528,7 +522,7 @@ def main():
             
             # Get and make AI move
             move_start = time.time()
-            move = game.get_best_move(depth=10)
+            move = game.get_best_move(depth=args.depth)
             move_time = time.time() - move_start
             move_times.append(move_time)
             total_moves += 1
@@ -541,6 +535,24 @@ def main():
                     title="Game Over! No valid moves"
                 ))
                 break
+    
+    # Save profiling results if enabled
+    if args.profile:
+        profiler.disable()
+        stats = pstats.Stats(profiler)
+        stats.sort_stats(SortKey.TIME)
+        
+        # Save raw profiling data
+        stats.dump_stats("game_profile.prof")
+        
+        # Print summary to console
+        print("\nTop 20 time-consuming functions:")
+        stats.sort_stats(SortKey.TIME).print_stats(20)
+        
+        print("\nProfile data saved to game_profile.prof")
+        print("To generate a flamegraph, you can use tools like:")
+        print("  - flameprof game_profile.prof > profile_flame.svg")
+        print("  - snakeviz game_profile.prof")
 
 if __name__ == "__main__":
     main()

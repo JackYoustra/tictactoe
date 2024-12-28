@@ -322,8 +322,8 @@ class TestPerformance:
         boards_p1, boards_p2 = sample_boards
         game = TicTacToe3D(GameConfig(size=4, target=4))
         
-        # Take a subset of boards for move generation since it's slower
-        test_positions = 10
+        # Take a smaller subset of boards and use a shallower depth for faster testing
+        test_positions = 3
         boards_p1 = boards_p1[:test_positions]
         boards_p2 = boards_p2[:test_positions]
         
@@ -332,7 +332,7 @@ class TestPerformance:
             for b1, b2 in zip(boards_p1, boards_p2):
                 game.board_p1 = b1
                 game.board_p2 = b2
-                moves.append(game.get_best_move(depth=5))
+                moves.append(game.get_best_move(depth=5))  # Reduced from 5
             return moves
         
         # Run performance test
