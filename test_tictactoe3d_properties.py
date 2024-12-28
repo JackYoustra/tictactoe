@@ -10,6 +10,8 @@ from tictactoe3d import (
     GameResult
 )
 from typing import List
+import json
+from pathlib import Path
 # Custom strategies
 @st.composite
 def valid_game_configs(draw):
@@ -188,18 +190,50 @@ class TestPerformance:
         warmup_iterations=5
     )
     def test_batch_evaluation_performance(self, benchmark, sample_boards):
-        """Benchmark batch evaluation performance"""
+        """Benchmark batch evaluation performance with regression detection"""
         boards_p1, boards_p2 = sample_boards
         game = TicTacToe3D(GameConfig(size=4, target=4))
         
         def run_batch():
             return game.evaluate_batch(boards_p1, boards_p2)
         
-        result = benchmark(run_batch)
+        # Run benchmark and get result
+        eval_result = benchmark(run_batch)  # This returns the function result
         
-        # Verify correctness
-        assert len(result) == len(boards_p1)
-        assert all(isinstance(r, np.int32) for r in result)
+        # Store performance metrics in version controlled file
+        snapshot_file = Path("performance_snapshots.json")
+        current_stats = {
+            "mean": float(benchmark.stats["mean"]),  # Access stats directly from benchmark
+            "stddev": float(benchmark.stats["stddev"]),
+            "rounds": int(benchmark.stats["rounds"]),
+            "iterations": len(boards_p1)
+        }
+        
+        if not snapshot_file.exists():
+            print("\nFirst run - storing baseline performance metrics:")
+            print(f"Mean time: {current_stats['mean']:.6f} seconds")
+            print(f"Std dev:   {current_stats['stddev']:.6f} seconds")
+            snapshot_data = {"batch_evaluation": current_stats}
+            snapshot_file.write_text(json.dumps(snapshot_data, indent=2))
+        else:
+            baseline = json.loads(snapshot_file.read_text()).get("batch_evaluation")
+            
+            # Compare with baseline
+            regression_threshold = 1.2  # 20% regression threshold
+            percent_change = ((current_stats["mean"] - baseline["mean"]) / baseline["mean"]) * 100
+            
+            print(f"\nPerformance comparison:")
+            print(f"Baseline mean: {baseline['mean']:.6f} seconds")
+            print(f"Current mean:  {current_stats['mean']:.6f} seconds")
+            print(f"Change:        {percent_change:+.2f}%")
+            
+            # Fail if regression is above threshold
+            assert current_stats["mean"] <= baseline["mean"] * regression_threshold, \
+                f"Performance regression detected: {percent_change:.1f}% slower than baseline"
+        
+        # Verify correctness of the actual computation result
+        assert len(eval_result) == len(boards_p1)
+        assert all(isinstance(r, np.int32) for r in eval_result)
 
 if __name__ == "__main__":
     pytest.main([__file__])

@@ -8,7 +8,7 @@ from enum import Enum, auto
 from typing import List, Set, Optional, Tuple, Union
 import numpy as np
 import numpy.typing as npt
-from numba import cuda, uint64, int32 # type: ignore
+from numba import cuda, uint64, int32, float32 # type: ignore
 import math
 import time
 from rich.live import Live
@@ -19,6 +19,11 @@ from rich.text import Text
 from rich.console import Console
 from collections import deque
 from statistics import mean
+
+# Constants for CUDA optimization
+WARP_SIZE = 32
+MAX_THREADS_PER_BLOCK = 1024
+MIN_BLOCKS_PER_SM = 2
 
 class GameResult(Enum):
     """Possible game states"""
@@ -213,38 +218,58 @@ class TicTacToe3D:
         for i, pattern in enumerate(self.patterns):
             pattern_array[i * self.num_u64s:(i + 1) * self.num_u64s] = pattern.bits
         
-        # CUDA setup
-        self.threadsperblock = 256
-        self.d_patterns = cuda.to_device(pattern_array)
+        # CUDA setup and optimization
+        device = cuda.get_current_device()
+        self.max_threads_per_block = min(device.MAX_THREADS_PER_BLOCK, MAX_THREADS_PER_BLOCK)
+        self.warp_size = WARP_SIZE
+        
+        # Calculate optimal thread count (multiple of warp size)
+        self.threadsperblock = min(
+            self.max_threads_per_block,
+            ((self.max_threads_per_block // self.warp_size) * self.warp_size)
+        )
+        
+        # Create pinned memory for patterns
+        self.pattern_array = cuda.pinned_array(pattern_array.shape, dtype=np.uint64)
+        self.pattern_array[:] = pattern_array
+        self.d_patterns = cuda.to_device(self.pattern_array)
         
         # Initialize empty boards for new game
         self.board_p1 = BitBoard(config)
         self.board_p2 = BitBoard(config)
         self.current_player = 1
+        
+        # Preallocate pinned memory for batch evaluation
+        self.max_batch_size = 1024  # Adjust based on your needs
+        self.h_boards_p1 = cuda.pinned_array((self.max_batch_size, self.num_u64s), dtype=np.uint64)
+        self.h_boards_p2 = cuda.pinned_array((self.max_batch_size, self.num_u64s), dtype=np.uint64)
     
     def evaluate_batch(self, boards_p1: List[BitBoard], 
                       boards_p2: List[BitBoard]) -> npt.NDArray[np.int32]:
         """Evaluate multiple board positions in parallel"""
         n_boards = len(boards_p1)
         assert len(boards_p2) == n_boards, "Must provide equal number of boards"
+        assert n_boards <= self.max_batch_size, f"Batch size {n_boards} exceeds maximum {self.max_batch_size}"
         
-        # Convert boards to CUDA-friendly format
-        cuda_boards_p1 = np.zeros((n_boards, self.num_u64s), dtype=np.uint64)
-        cuda_boards_p2 = np.zeros((n_boards, self.num_u64s), dtype=np.uint64)
-        
+        # Copy boards to pinned memory
         for i in range(n_boards):
-            cuda_boards_p1[i] = boards_p1[i].bits
-            cuda_boards_p2[i] = boards_p2[i].bits
+            self.h_boards_p1[i] = boards_p1[i].bits
+            self.h_boards_p2[i] = boards_p2[i].bits
         
-        # Prepare results array
+        # Transfer to device using pinned memory
+        d_boards_p1 = cuda.to_device(self.h_boards_p1[:n_boards])
+        d_boards_p2 = cuda.to_device(self.h_boards_p2[:n_boards])
         d_results = cuda.device_array(n_boards, dtype=np.int32)
         
-        # Calculate grid size
-        blockspergrid = (n_boards + (self.threadsperblock - 1)) // self.threadsperblock
+        # Calculate optimal grid size
+        min_grid_size = (n_boards + self.threadsperblock - 1) // self.threadsperblock
+        device = cuda.get_current_device()
+        max_blocks = device.MULTIPROCESSOR_COUNT * MIN_BLOCKS_PER_SM
+        blockspergrid = max(min_grid_size, max_blocks)
         
         # Launch kernel
         evaluate_boards_kernel[blockspergrid, self.threadsperblock](
-            cuda_boards_p1, cuda_boards_p2, d_results,
+            d_boards_p1, d_boards_p2, d_results,
             self.d_patterns, np.int32(len(self.patterns)), np.int32(self.num_u64s)
         )
         
