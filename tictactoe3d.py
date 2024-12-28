@@ -10,6 +10,15 @@ import numpy as np
 import numpy.typing as npt
 from numba import cuda, uint64, int32 # type: ignore
 import math
+import time
+from rich.live import Live
+from rich.table import Table
+from rich.layout import Layout
+from rich.panel import Panel
+from rich.text import Text
+from rich.console import Console
+from collections import deque
+from statistics import mean
 
 class GameResult(Enum):
     """Possible game states"""
@@ -376,41 +385,115 @@ class TicTacToe3D:
                 print()
             print()
 
+def create_board_table(game: TicTacToe3D) -> Table:
+    """Create a rich table representation of the board"""
+    table = Table(show_header=False, show_edge=False, padding=0, box=None)
+    
+    # Add columns for each level
+    for _ in range(game.size):
+        table.add_column(justify="center", width=game.size * 2 + 1)
+    
+    # Add rows for each level
+    for y in range(game.size):
+        row = []
+        for z in range(game.size):
+            level = ""
+            for x in range(game.size):
+                if game.board_p1.get_bit(x, y, z):
+                    level += "X "
+                elif game.board_p2.get_bit(x, y, z):
+                    level += "O "
+                else:
+                    level += ". "
+            row.append(level.strip())
+        table.add_row(*row)
+    
+    return table
+
+def create_stats_panel(moves_per_sec: float, evals_per_sec: float, 
+                      total_moves: int, total_evals: int,
+                      move_times: List[float], eval_times: List[float]) -> Panel:
+    """Create a panel with performance statistics"""
+    stats = Text()
+    stats.append("Performance Metrics\n\n", style="bold")
+    stats.append(f"Moves/sec: {moves_per_sec:.2f}\n")
+    stats.append(f"Evals/sec: {evals_per_sec:.2f}\n")
+    stats.append(f"Total moves: {total_moves}\n")
+    stats.append(f"Total evals: {total_evals}\n")
+    
+    # Handle empty data cases
+    avg_move_time = mean(move_times)*1000 if move_times else 0.0
+    avg_eval_time = mean(eval_times)*1000 if eval_times else 0.0
+    
+    stats.append(f"Avg move time: {avg_move_time:.2f}ms\n")
+    stats.append(f"Avg eval time: {avg_eval_time:.2f}ms\n")
+    return Panel(stats, title="Stats")
+
 def main():
-    """Example usage"""
+    """Self-playing game with performance metrics"""
     # Create a 4x4x4 game where you need 4 in a row to win
     config = GameConfig(size=4, target=4)
     game = TicTacToe3D(config)
     
-    # Example game loop
-    while True:
-        game.print_board()
-        state = game.get_game_state()
-        
-        if state != GameResult.IN_PROGRESS:
-            print(f"Game Over! Result: {state.name}")
-            break
-        
-        if game.current_player == 1:
-            # Human player
-            try:
-                x = int(input("Enter x coordinate: "))
-                y = int(input("Enter y coordinate: "))
-                z = int(input("Enter z coordinate: "))
-                if not game.make_move(x, y, z):
-                    print("Invalid move, try again")
-                    continue
-            except ValueError:
-                print("Invalid input, try again")
-                continue
-        else:
-            # AI player
+    # Performance tracking
+    move_times: deque = deque(maxlen=100)
+    eval_times: deque = deque(maxlen=100)
+    total_moves = 0
+    total_evals = 0
+    start_time = time.time()
+    
+    # Create layout
+    layout = Layout()
+    layout.split_row(
+        Layout(name="board", ratio=2),
+        Layout(name="stats", ratio=1)
+    )
+    
+    with Live(layout, refresh_per_second=4) as live:
+        while True:
+            # Update board display
+            layout["board"].update(Panel(create_board_table(game), title="3D Tic-Tac-Toe"))
+            
+            # Get game state and track evaluation time
+            eval_start = time.time()
+            state = game.get_game_state()
+            eval_time = time.time() - eval_start
+            eval_times.append(eval_time)
+            total_evals += 1
+            
+            # Calculate performance metrics
+            elapsed = time.time() - start_time
+            moves_per_sec = total_moves / elapsed if elapsed > 0 else 0
+            evals_per_sec = total_evals / elapsed if elapsed > 0 else 0
+            
+            # Update stats display
+            layout["stats"].update(create_stats_panel(
+                moves_per_sec, evals_per_sec,
+                total_moves, total_evals,
+                list(move_times), list(eval_times)
+            ))
+            
+            if state != GameResult.IN_PROGRESS:
+                layout["board"].update(Panel(
+                    create_board_table(game), 
+                    title=f"Game Over! Result: {state.name}"
+                ))
+                break
+            
+            # Get and make AI move
+            move_start = time.time()
             move = game.get_best_move(depth=3)
+            move_time = time.time() - move_start
+            move_times.append(move_time)
+            total_moves += 1
+            
             if move:
-                print(f"AI moves to: {move}")
                 game.make_move(*move)
             else:
-                print("AI could not find a move")
+                layout["board"].update(Panel(
+                    create_board_table(game), 
+                    title="Game Over! No valid moves"
+                ))
                 break
 
 if __name__ == "__main__":
