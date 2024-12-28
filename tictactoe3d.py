@@ -459,22 +459,27 @@ def find_best_move_kernel(board_p1: uint64[:], board_p2: uint64[:],
                          patterns: uint64[:], best_move: int32[:],
                          depth: int32, size: int32, num_u64s: int32,
                          n_patterns: int32):
-    """Parallel kernel to find the best move using root splitting"""
+    """Parallel kernel using block-level evaluation and warp-level pattern matching"""
     # Get block and thread indices
     block_idx = cuda.blockIdx.x
     thread_idx = cuda.threadIdx.x
+    warp_idx = thread_idx // WARP_SIZE
+    lane_idx = thread_idx % WARP_SIZE
     
-    # Shared memory for this block's evaluation
-    shared_board = cuda.shared.array(shape=64, dtype=uint64)  
+    # Shared memory for block-wide computation
+    shared_board = cuda.shared.array(shape=64, dtype=uint64)
     shared_moves = cuda.shared.array(shape=512, dtype=int32)
     shared_n_moves = cuda.shared.array(shape=1, dtype=int32)
-    shared_evals = cuda.shared.array(shape=1024, dtype=float32)  # For move evaluations
+    shared_evals = cuda.shared.array(shape=32, dtype=float32)  # One per warp
+    shared_patterns = cuda.shared.array(shape=64, dtype=uint64)  # Cache patterns
     
-    # First thread in block initializes shared memory
-    if thread_idx == 0:
-        shared_n_moves[0] = 0
-        get_valid_moves_device(board_p1, board_p2, shared_moves, shared_n_moves, 
-                             size, num_u64s)
+    # First warp initializes shared memory
+    if warp_idx == 0:
+        if lane_idx < num_u64s:
+            shared_board[lane_idx] = board_p1[lane_idx]
+        if lane_idx == 0:
+            shared_n_moves[0] = 0
+            get_valid_moves_device(board_p1, board_p2, shared_moves, shared_n_moves, size, num_u64s)
     cuda.syncthreads()
     
     n_moves = shared_n_moves[0]
@@ -482,41 +487,66 @@ def find_best_move_kernel(board_p1: uint64[:], board_p2: uint64[:],
     start_move = block_idx * moves_per_block
     end_move = min(start_move + moves_per_block, n_moves)
     
-    # Each thread evaluates subset of moves within its block's range
-    moves_per_thread = (end_move - start_move + cuda.blockDim.x - 1) // cuda.blockDim.x
-    my_start = start_move + thread_idx * moves_per_thread
-    my_end = min(my_start + moves_per_thread, end_move)
+    # Each warp handles a subset of moves
+    moves_per_warp = (end_move - start_move + (cuda.blockDim.x // WARP_SIZE) - 1) // (cuda.blockDim.x // WARP_SIZE)
+    my_start = start_move + warp_idx * moves_per_warp
+    my_end = min(my_start + moves_per_warp, end_move)
     
-    # Copy board to shared memory
-    if thread_idx < num_u64s:
-        shared_board[thread_idx] = board_p1[thread_idx]
+    # Warp-level evaluation
+    if my_start < my_end:
+        warp_best_eval = float32(-1000.0)
+        warp_best_move = int32(-1)
+        
+        # Each thread in warp helps evaluate position
+        for move_idx in range(my_start, my_end):
+            move = shared_moves[move_idx]
+            
+            # Make move cooperatively within warp
+            if lane_idx < num_u64s:
+                make_move_device(shared_board, move, size)
+            cuda.syncwarp()
+            
+            # Evaluate position using warp-level pattern matching
+            eval = float32(0.0)
+            patterns_per_thread = (n_patterns + WARP_SIZE - 1) // WARP_SIZE
+            for i in range(patterns_per_thread):
+                pattern_idx = i * WARP_SIZE + lane_idx
+                if pattern_idx < n_patterns:
+                    pattern_offset = pattern_idx * num_u64s
+                    if check_pattern_match(shared_board, patterns[pattern_offset:pattern_offset + num_u64s], num_u64s):
+                        eval = float32(1.0)
+                        break
+            
+            # Warp reduction to get final evaluation
+            for offset in [16, 8, 4, 2, 1]:
+                other = cuda.shfl_xor_sync(0xffffffff, eval, offset)
+                eval = max(eval, other)
+            
+            if lane_idx == 0:
+                if eval > warp_best_eval:
+                    warp_best_eval = eval
+                    warp_best_move = move
+            
+            # Undo move cooperatively
+            if lane_idx < num_u64s:
+                clear_move_device(shared_board, move, size)
+            cuda.syncwarp()
+        
+        # Store warp results
+        if lane_idx == 0:
+            shared_evals[warp_idx] = warp_best_eval
+            if warp_best_move >= 0:
+                cuda.atomic.max(best_move, 0, warp_best_move)
+    
     cuda.syncthreads()
     
-    # Evaluate moves in parallel
-    for i in range(my_start, my_end):
-        move = shared_moves[i]
-        make_move_device(shared_board, move, size)
-        
-        eval = minimax_device(shared_board, board_p2, patterns, n_patterns,
-                            depth-1, float32(-1000.0), float32(1000.0), False,
-                            size, num_u64s, best_move, shared_board,
-                            shared_moves, shared_n_moves)
-        
-        shared_evals[i] = eval
-        clear_move_device(shared_board, move, size)
-    cuda.syncthreads()
-    
-    # Parallel reduction to find best move
-    if thread_idx == 0:
-        best_eval = float32(-1000.0)
-        best_idx = -1
-        for i in range(my_start, my_end):
-            if shared_evals[i] > best_eval:
-                best_eval = shared_evals[i]
-                best_idx = i
-        
-        if best_idx >= 0:
-            cuda.atomic.max(best_move, 0, shared_moves[best_idx])
+    # Final reduction across warps (first warp only)
+    if warp_idx == 0 and lane_idx == 0:
+        block_best_eval = float32(-1000.0)
+        n_warps = (cuda.blockDim.x + WARP_SIZE - 1) // WARP_SIZE
+        for i in range(n_warps):
+            if shared_evals[i] > block_best_eval:
+                block_best_eval = shared_evals[i]
 
 class TicTacToeEngine(ABC):
     """Abstract base class for TicTacToe engines"""
