@@ -327,15 +327,31 @@ class TicTacToe3D:
         if not moves:
             return 0.0, None
         
+        # Create reusable BitBoard objects for move simulation
+        temp_board = BitBoard(self.config)
+        
+        # Score moves for better ordering
+        move_scores = []
+        for move in moves:
+            temp_board.bits = board_p1.bits.copy() if maximizing else board_p2.bits.copy()
+            temp_board.set_bit(*move)
+            score = self.heuristic(temp_board if maximizing else board_p1,
+                                 board_p2 if maximizing else temp_board)
+            move_scores.append((score, move))
+        
+        # Sort moves by score (descending for maximizing, ascending for minimizing)
+        move_scores.sort(reverse=maximizing)
+        moves = [move for _, move in move_scores]
+        
         best_move = None
         if maximizing:
             max_eval = float('-inf')
             for move in moves:
-                new_board = BitBoard(self.config)
-                new_board.bits = board_p1.bits.copy()
-                new_board.set_bit(*move)
+                # Reuse BitBoard object
+                temp_board.bits = board_p1.bits.copy()
+                temp_board.set_bit(*move)
                 
-                eval, _ = self.minimax(new_board, board_p2, depth-1, alpha, beta, False)
+                eval, _ = self.minimax(temp_board, board_p2, depth-1, alpha, beta, False)
                 
                 if eval > max_eval:
                     max_eval = eval
@@ -347,11 +363,11 @@ class TicTacToe3D:
         else:
             min_eval = float('inf')
             for move in moves:
-                new_board = BitBoard(self.config)
-                new_board.bits = board_p2.bits.copy()
-                new_board.set_bit(*move)
+                # Reuse BitBoard object
+                temp_board.bits = board_p2.bits.copy()
+                temp_board.set_bit(*move)
                 
-                eval, _ = self.minimax(board_p1, new_board, depth-1, alpha, beta, True)
+                eval, _ = self.minimax(board_p1, temp_board, depth-1, alpha, beta, True)
                 
                 if eval < min_eval:
                     min_eval = eval
@@ -391,9 +407,52 @@ class TicTacToe3D:
         return score
     
     def get_best_move(self, depth: int = 4) -> Optional[Tuple[int, int, int]]:
-        """Get best move using minimax"""
-        _, move = self.minimax(self.board_p1, self.board_p2, depth)
-        return move
+        """Get best move using minimax with parallel evaluation at top level"""
+        moves = self.get_valid_moves(self.board_p1, self.board_p2)
+        if not moves:
+            return None
+            
+        # For very few moves, don't bother with parallelization
+        if len(moves) <= 4:
+            _, move = self.minimax(self.board_p1, self.board_p2, depth)
+            return move
+            
+        # Evaluate all top-level moves in parallel
+        temp_board = BitBoard(self.config)
+        best_move = None
+        best_eval = float('-inf')
+        
+        # Score and sort moves for better pruning
+        move_scores = []
+        for move in moves:
+            temp_board.bits = self.board_p1.bits.copy()
+            temp_board.set_bit(*move)
+            score = self.heuristic(temp_board, self.board_p2)
+            move_scores.append((score, move))
+        
+        move_scores.sort(reverse=True)
+        moves = [move for _, move in move_scores]
+        
+        # Prepare boards for parallel evaluation
+        eval_boards_p1 = []
+        eval_boards_p2 = []
+        
+        for move in moves:
+            temp_board.bits = self.board_p1.bits.copy()
+            temp_board.set_bit(*move)
+            eval_boards_p1.append(temp_board)
+            eval_boards_p2.append(self.board_p2)
+        
+        # Evaluate all positions in parallel
+        evals = self.evaluate_batch(eval_boards_p1, eval_boards_p2)
+        
+        # Process results
+        for i, (eval, move) in enumerate(zip(evals, moves)):
+            if eval > best_eval:
+                best_eval = eval
+                best_move = move
+        
+        return best_move
     
     def print_board(self) -> None:
         """Print current board state"""

@@ -183,6 +183,65 @@ class TestPerformance:
         
         return boards_p1, boards_p2
 
+    def run_performance_test(self, benchmark, test_name: str, test_fn, 
+                           test_args: dict, iterations: int,
+                           improvement_threshold: float = 0.9) -> None:
+        """
+        Run a performance test with baseline comparison and optional baseline update
+        
+        Args:
+            benchmark: pytest benchmark fixture
+            test_name: Name of the test for storing in snapshots
+            test_fn: Function to benchmark
+            test_args: Arguments to pass to the test function
+            iterations: Number of iterations being tested
+            improvement_threshold: Threshold for updating baseline (e.g., 0.9 means 10% faster)
+        """
+        # Run benchmark
+        result = benchmark(test_fn)
+        
+        # Store performance metrics
+        snapshot_file = Path("performance_snapshots.json")
+        current_stats = {
+            "mean": float(benchmark.stats["mean"]),
+            "stddev": float(benchmark.stats["stddev"]),
+            "rounds": int(benchmark.stats["rounds"]),
+            "iterations": iterations
+        }
+        
+        if snapshot_file.exists():
+            data = json.loads(snapshot_file.read_text())
+        else:
+            data = {}
+        
+        if test_name not in data:
+            print(f"\nFirst run - storing baseline {test_name} metrics:")
+            print(f"Mean time: {current_stats['mean']:.6f} seconds")
+            print(f"Std dev:   {current_stats['stddev']:.6f} seconds")
+            data[test_name] = current_stats
+            snapshot_file.write_text(json.dumps(data, indent=2))
+        else:
+            baseline = data[test_name]
+            
+            # Compare with baseline
+            percent_change = ((current_stats["mean"] - baseline["mean"]) / baseline["mean"]) * 100
+            
+            print(f"\n{test_name} Performance comparison:")
+            print(f"Baseline mean: {baseline['mean']:.6f} seconds")
+            print(f"Current mean:  {current_stats['mean']:.6f} seconds")
+            print(f"Change:        {percent_change:+.2f}%")
+            
+            # Update baseline if there's a significant improvement
+            if current_stats["mean"] <= baseline["mean"] * improvement_threshold:
+                print(f"\nSignificant improvement detected! Updating baseline.")
+                data[test_name] = current_stats
+                snapshot_file.write_text(json.dumps(data, indent=2))
+            # Still fail if it's a significant regression
+            elif current_stats["mean"] > baseline["mean"] * 1.2:  # 20% regression threshold
+                assert False, f"Performance regression detected: {percent_change:.1f}% slower than baseline"
+        
+        return result
+
     @pytest.mark.benchmark(
         group="cuda",
         min_rounds=10,
@@ -197,49 +256,25 @@ class TestPerformance:
         def run_batch():
             return game.evaluate_batch(boards_p1, boards_p2)
         
-        # Run benchmark and get result
-        eval_result = benchmark(run_batch)  # This returns the function result
+        # Run performance test
+        eval_result = self.run_performance_test(
+            benchmark=benchmark,
+            test_name="batch_evaluation",
+            test_fn=run_batch,
+            test_args={},
+            iterations=len(boards_p1),
+            improvement_threshold=0.9  # Update baseline if 10% faster
+        )
         
-        # Store performance metrics in version controlled file
-        snapshot_file = Path("performance_snapshots.json")
-        current_stats = {
-            "mean": float(benchmark.stats["mean"]),  # Access stats directly from benchmark
-            "stddev": float(benchmark.stats["stddev"]),
-            "rounds": int(benchmark.stats["rounds"]),
-            "iterations": len(boards_p1)
-        }
-        
-        if not snapshot_file.exists():
-            print("\nFirst run - storing baseline performance metrics:")
-            print(f"Mean time: {current_stats['mean']:.6f} seconds")
-            print(f"Std dev:   {current_stats['stddev']:.6f} seconds")
-            snapshot_data = {"batch_evaluation": current_stats}
-            snapshot_file.write_text(json.dumps(snapshot_data, indent=2))
-        else:
-            baseline = json.loads(snapshot_file.read_text()).get("batch_evaluation")
-            
-            # Compare with baseline
-            regression_threshold = 1.2  # 20% regression threshold
-            percent_change = ((current_stats["mean"] - baseline["mean"]) / baseline["mean"]) * 100
-            
-            print(f"\nPerformance comparison:")
-            print(f"Baseline mean: {baseline['mean']:.6f} seconds")
-            print(f"Current mean:  {current_stats['mean']:.6f} seconds")
-            print(f"Change:        {percent_change:+.2f}%")
-            
-            # Fail if regression is above threshold
-            assert current_stats["mean"] <= baseline["mean"] * regression_threshold, \
-                f"Performance regression detected: {percent_change:.1f}% slower than baseline"
-        
-        # Verify correctness of the actual computation result
+        # Verify correctness
         assert len(eval_result) == len(boards_p1)
         assert all(isinstance(r, np.int32) for r in eval_result)
 
     @pytest.mark.benchmark(
         group="minimax",
-        min_rounds=2,  # Fewer rounds since move generation is slower
+        min_rounds=5,  # Fewer rounds since move generation is slower
         warmup=True,
-        warmup_iterations=1
+        warmup_iterations=2
     )
     def test_move_generation_performance(self, benchmark, sample_boards):
         """Benchmark move generation performance with regression detection"""
@@ -247,7 +282,7 @@ class TestPerformance:
         game = TicTacToe3D(GameConfig(size=4, target=4))
         
         # Take a subset of boards for move generation since it's slower
-        test_positions = 1
+        test_positions = 10
         boards_p1 = boards_p1[:test_positions]
         boards_p2 = boards_p2[:test_positions]
         
@@ -259,46 +294,17 @@ class TestPerformance:
                 moves.append(game.get_best_move(depth=3))
             return moves
         
-        # Run benchmark and get result
-        move_result = benchmark(run_move_generation)
+        # Run performance test
+        move_result = self.run_performance_test(
+            benchmark=benchmark,
+            test_name="move_generation",
+            test_fn=run_move_generation,
+            test_args={},
+            iterations=test_positions,
+            improvement_threshold=0.9  # Update baseline if 10% faster
+        )
         
-        # Store performance metrics
-        snapshot_file = Path("performance_snapshots.json")
-        current_stats = {
-            "mean": float(benchmark.stats["mean"]),
-            "stddev": float(benchmark.stats["stddev"]),
-            "rounds": int(benchmark.stats["rounds"]),
-            "iterations": test_positions
-        }
-        
-        if snapshot_file.exists():
-            data = json.loads(snapshot_file.read_text())
-        else:
-            data = {}
-        
-        if "move_generation" not in data:
-            print("\nFirst run - storing baseline move generation metrics:")
-            print(f"Mean time: {current_stats['mean']:.6f} seconds")
-            print(f"Std dev:   {current_stats['stddev']:.6f} seconds")
-            data["move_generation"] = current_stats
-            snapshot_file.write_text(json.dumps(data, indent=2))
-        else:
-            baseline = data["move_generation"]
-            
-            # Compare with baseline
-            regression_threshold = 1.2  # 20% regression threshold
-            percent_change = ((current_stats["mean"] - baseline["mean"]) / baseline["mean"]) * 100
-            
-            print(f"\nMove Generation Performance comparison:")
-            print(f"Baseline mean: {baseline['mean']:.6f} seconds")
-            print(f"Current mean:  {current_stats['mean']:.6f} seconds")
-            print(f"Change:        {percent_change:+.2f}%")
-            
-            # Fail if regression is above threshold
-            assert current_stats["mean"] <= baseline["mean"] * regression_threshold, \
-                f"Performance regression detected: {percent_change:.1f}% slower than baseline"
-        
-        # Verify correctness of the actual computation result
+        # Verify correctness
         assert len(move_result) == test_positions
         # Each result should be None or a valid move tuple
         for move in move_result:
