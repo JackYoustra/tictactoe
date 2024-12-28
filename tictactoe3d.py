@@ -390,25 +390,133 @@ def minimax_device(board_p1: uint64[:], board_p2: uint64[:],
         
         return min_eval
 
+@cuda.jit(device=True)
+def parallel_minimax_device(board_p1: uint64[:], board_p2: uint64[:],
+                          patterns: uint64[:], n_patterns: int32,
+                          depth: int32, alpha: float32, beta: float32,
+                          maximizing: bool, size: int32, num_u64s: int32,
+                          best_move: int32[:], temp_board: uint64[:],
+                          moves: int32[:], n_moves: int32[:],
+                          beam_width: int32 = 8) -> float32:
+    """Parallel minimax with beam search optimization"""
+    # Terminal state checks using warp-level parallelism
+    warp_id = cuda.threadIdx.x & 0x1f
+    if warp_id < n_patterns:
+        pattern_offset = warp_id * num_u64s
+        if check_pattern_match(board_p1, patterns[pattern_offset:pattern_offset + num_u64s], num_u64s):
+            return float32(1.0)
+        if check_pattern_match(board_p2, patterns[pattern_offset:pattern_offset + num_u64s], num_u64s):
+            return float32(-1.0)
+    
+    if depth == 0:
+        return evaluate_heuristic_device(board_p1, board_p2, patterns, n_patterns, num_u64s)
+    
+    # Get valid moves
+    get_valid_moves_device(board_p1, board_p2, moves, n_moves, size, num_u64s)
+    if n_moves[0] == 0:
+        return float32(0.0)
+    
+    # Use beam search to evaluate only the most promising moves
+    n_eval = min(n_moves[0], beam_width)
+    
+    if maximizing:
+        max_eval = float32(-1000.0)
+        for i in range(n_eval):
+            move = moves[i]
+            make_move_device(temp_board, move, size)
+            
+            eval = parallel_minimax_device(temp_board, board_p2, patterns, n_patterns,
+                                        depth - 1, alpha, beta, False,
+                                        size, num_u64s, best_move, temp_board,
+                                        moves, n_moves, beam_width)
+            
+            clear_move_device(temp_board, move, size)
+            max_eval = max(max_eval, eval)
+            alpha = max(alpha, eval)
+            if beta <= alpha:
+                break
+        return max_eval
+    else:
+        min_eval = float32(1000.0)
+        for i in range(n_eval):
+            move = moves[i]
+            make_move_device(temp_board, move, size)
+            
+            eval = parallel_minimax_device(board_p1, temp_board, patterns, n_patterns,
+                                        depth - 1, alpha, beta, True,
+                                        size, num_u64s, best_move, temp_board,
+                                        moves, n_moves, beam_width)
+            
+            clear_move_device(temp_board, move, size)
+            min_eval = min(min_eval, eval)
+            beta = min(beta, eval)
+            if beta <= alpha:
+                break
+        return min_eval
+
 @cuda.jit
 def find_best_move_kernel(board_p1: uint64[:], board_p2: uint64[:],
                          patterns: uint64[:], best_move: int32[:],
                          depth: int32, size: int32, num_u64s: int32,
                          n_patterns: int32):
-    """Kernel to find the best move"""
-    if cuda.grid(1) > 0:  # Only use first thread
-        return
+    """Parallel kernel to find the best move using root splitting"""
+    # Get block and thread indices
+    block_idx = cuda.blockIdx.x
+    thread_idx = cuda.threadIdx.x
     
-    # Allocate shared memory for temporary storage
-    temp_board = cuda.shared.array(shape=64, dtype=uint64)  # Adjust size as needed
-    moves = cuda.shared.array(shape=512, dtype=int32)  # Max possible moves
-    n_moves = cuda.shared.array(shape=1, dtype=int32)
+    # Shared memory for this block's evaluation
+    shared_board = cuda.shared.array(shape=64, dtype=uint64)  
+    shared_moves = cuda.shared.array(shape=512, dtype=int32)
+    shared_n_moves = cuda.shared.array(shape=1, dtype=int32)
+    shared_evals = cuda.shared.array(shape=1024, dtype=float32)  # For move evaluations
     
-    best_move[1] = depth  # Store original depth for root move tracking
-    minimax_device(board_p1, board_p2, patterns, n_patterns,
-                  depth, float32(-1000.0), float32(1000.0), True,
-                  size, num_u64s, best_move, temp_board,
-                  moves, n_moves)
+    # First thread in block initializes shared memory
+    if thread_idx == 0:
+        shared_n_moves[0] = 0
+        get_valid_moves_device(board_p1, board_p2, shared_moves, shared_n_moves, 
+                             size, num_u64s)
+    cuda.syncthreads()
+    
+    n_moves = shared_n_moves[0]
+    moves_per_block = (n_moves + cuda.gridDim.x - 1) // cuda.gridDim.x
+    start_move = block_idx * moves_per_block
+    end_move = min(start_move + moves_per_block, n_moves)
+    
+    # Each thread evaluates subset of moves within its block's range
+    moves_per_thread = (end_move - start_move + cuda.blockDim.x - 1) // cuda.blockDim.x
+    my_start = start_move + thread_idx * moves_per_thread
+    my_end = min(my_start + moves_per_thread, end_move)
+    
+    # Copy board to shared memory
+    if thread_idx < num_u64s:
+        shared_board[thread_idx] = board_p1[thread_idx]
+    cuda.syncthreads()
+    
+    # Evaluate moves in parallel
+    for i in range(my_start, my_end):
+        move = shared_moves[i]
+        make_move_device(shared_board, move, size)
+        
+        eval = minimax_device(shared_board, board_p2, patterns, n_patterns,
+                            depth-1, float32(-1000.0), float32(1000.0), False,
+                            size, num_u64s, best_move, shared_board,
+                            shared_moves, shared_n_moves)
+        
+        shared_evals[i] = eval
+        clear_move_device(shared_board, move, size)
+    cuda.syncthreads()
+    
+    # Parallel reduction to find best move
+    if thread_idx == 0:
+        best_eval = float32(-1000.0)
+        best_idx = -1
+        for i in range(my_start, my_end):
+            if shared_evals[i] > best_eval:
+                best_eval = shared_evals[i]
+                best_idx = i
+        
+        if best_idx >= 0:
+            cuda.atomic.max(best_move, 0, shared_moves[best_idx])
 
 class TicTacToeEngine(ABC):
     """Abstract base class for TicTacToe engines"""
@@ -601,12 +709,24 @@ class GPUEngine(TicTacToeEngine):
         return GameResult(d_result.copy_to_host()[0])
     
     def get_best_move(self, board_p1: BitBoard, board_p2: BitBoard, depth: int) -> Optional[Tuple[int, int, int]]:
-        """Get best move using GPU-accelerated minimax"""
+        """Get best move using GPU-accelerated parallel minimax"""
         # Allocate device memory for result
         best_move = cuda.device_array(2, dtype=np.int32)  # [move, original_depth]
         
-        # Launch kernel
-        find_best_move_kernel[1, 1](
+        # Calculate optimal grid and block dimensions
+        device = cuda.get_current_device()
+        max_threads = min(device.MAX_THREADS_PER_BLOCK, 256)  # Use smaller thread blocks for better occupancy
+        threads_per_block = min(max_threads, ((max_threads // WARP_SIZE) * WARP_SIZE))
+        
+        # Estimate number of moves for grid size
+        total_positions = self.size * self.size * self.size
+        max_moves = total_positions  # Upper bound
+        min_blocks = (max_moves + threads_per_block - 1) // threads_per_block
+        max_blocks = device.MULTIPROCESSOR_COUNT * MIN_BLOCKS_PER_SM
+        blocks_per_grid = max(min_blocks, max_blocks)
+        
+        # Launch kernel with optimal configuration
+        find_best_move_kernel[blocks_per_grid, threads_per_block](
             cuda.to_device(board_p1.bits),
             cuda.to_device(board_p2.bits),
             self.d_patterns,
@@ -770,7 +890,7 @@ class TicTacToe3D:
         
         # Create engine based on type
         if engine_type.lower() == "cpu":
-            self._engine = CPUEngine(config)
+            self._engine: TicTacToeEngine = CPUEngine(config)
         elif engine_type.lower() == "gpu":
             self._engine = GPUEngine(config)
         else:
