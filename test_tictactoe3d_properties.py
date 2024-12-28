@@ -155,6 +155,29 @@ class TestTicTacToe3D:
         assert len(moves) == game_3x3.size ** 3 - 1
         assert (0, 0, 0) not in moves
 
+    @pytest.mark.benchmark(
+        group="perfect_play",
+        min_rounds=1,  # This is a deep test, so one round is sufficient
+        warmup=False
+    )
+    def test_perfect_play_draw(self, game_3x3, benchmark):
+        """Verify that 3x3x3 with perfect play results in a draw"""
+        def simulate_perfect_game():
+            while True:
+                state = game_3x3.get_game_state()
+                if state != GameResult.IN_PROGRESS:
+                    return state
+                
+                # Get best move with deep search for perfect play
+                move = game_3x3.get_best_move(depth=20)
+                if move is None:
+                    return game_3x3.get_game_state()
+                game_3x3.make_move(*move)
+        
+        # Run the perfect game simulation
+        result = benchmark(simulate_perfect_game)
+        assert result == GameResult.DRAW, "3x3x3 should be a draw with perfect play"
+
 class TestPerformance:
     @pytest.fixture
     def sample_boards(self) -> tuple[List[BitBoard], List[BitBoard]]:
