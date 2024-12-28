@@ -15,4 +15,12 @@ dev-dependencies = [
     "hypothesis>=6.123.2",
     "pytest>=8.3.4",
     "pytest-benchmark>=5.1.0",
+    "pytest-timeout>=2.3.1",
+]
+
+[tool.pytest.ini_options]
+timeout = 5  # Global timeout of 5 seconds for all tests
+markers = [
+    "benchmark: marks tests as benchmarks",
+    "timeout: marks timeout for tests",
 ]

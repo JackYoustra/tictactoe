@@ -400,59 +400,21 @@ class TicTacToe3D:
                         p2_count += bin(board_p2.bits[i] & pattern.bits[i]).count('1')
             
             if p1_match:
-                score += 0.1 * p1_count
+                score += p1_count / self.config.target
             if p2_match:
-                score -= 0.1 * p2_count
+                score -= p2_count / self.config.target
         
-        return score
+        return score / len(self.patterns)  # Normalize by number of patterns
     
     def get_best_move(self, depth: int = 4) -> Optional[Tuple[int, int, int]]:
-        """Get best move using minimax with parallel evaluation at top level"""
+        """Get best move using minimax with parallel evaluation"""
         moves = self.get_valid_moves(self.board_p1, self.board_p2)
         if not moves:
             return None
             
-        # For very few moves, don't bother with parallelization
-        if len(moves) <= 4:
-            _, move = self.minimax(self.board_p1, self.board_p2, depth)
-            return move
-            
-        # Evaluate all top-level moves in parallel
-        temp_board = BitBoard(self.config)
-        best_move = None
-        best_eval = float('-inf')
-        
-        # Score and sort moves for better pruning
-        move_scores = []
-        for move in moves:
-            temp_board.bits = self.board_p1.bits.copy()
-            temp_board.set_bit(*move)
-            score = self.heuristic(temp_board, self.board_p2)
-            move_scores.append((score, move))
-        
-        move_scores.sort(reverse=True)
-        moves = [move for _, move in move_scores]
-        
-        # Prepare boards for parallel evaluation
-        eval_boards_p1 = []
-        eval_boards_p2 = []
-        
-        for move in moves:
-            temp_board.bits = self.board_p1.bits.copy()
-            temp_board.set_bit(*move)
-            eval_boards_p1.append(temp_board)
-            eval_boards_p2.append(self.board_p2)
-        
-        # Evaluate all positions in parallel
-        evals = self.evaluate_batch(eval_boards_p1, eval_boards_p2)
-        
-        # Process results
-        for i, (eval, move) in enumerate(zip(evals, moves)):
-            if eval > best_eval:
-                best_eval = eval
-                best_move = move
-        
-        return best_move
+        # Always use minimax for move selection
+        _, move = self.minimax(self.board_p1, self.board_p2, depth)
+        return move
     
     def print_board(self) -> None:
         """Print current board state"""

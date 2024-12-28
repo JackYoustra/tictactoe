@@ -1,7 +1,10 @@
 {
   "python.testing.pytestArgs": [
-    "."
+    ".",
+    "--timeout=5",
+    "--timeout-method=thread"
   ],
   "python.testing.unittestEnabled": false,
-  "python.testing.pytestEnabled": true
+  "python.testing.pytestEnabled": true,
+  "python.testing.autoTestDiscoverOnSaveEnabled": true
 }

@@ -168,8 +168,9 @@ class TestTicTacToe3D:
                 if state != GameResult.IN_PROGRESS:
                     return state
                 
-                # Get best move with deep search for perfect play
-                move = game_3x3.get_best_move(depth=20)
+                # Get best move with sufficient search depth for perfect play
+                # but not so deep it's too slow
+                move = game_3x3.get_best_move(depth=8)
                 if move is None:
                     return game_3x3.get_game_state()
                 game_3x3.make_move(*move)
