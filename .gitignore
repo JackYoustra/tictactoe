@@ -1,0 +1,16 @@
+# Ignore files cached by Hypothesis...
+.hypothesis/*
+# except for the examples directory
+!.hypothesis/examples/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
+
+# Ignore all local history of files
+.history/
+.ionide/
+
+__pycache__/
