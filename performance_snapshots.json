@@ -10,5 +10,23 @@
     "stddev": 0.0012793931047999129,
     "rounds": 25,
     "iterations": 10
+  },
+  "engine_gpu": {
+    "mean": 0.004351451255268407,
+    "stddev": 0.0004058521486894855,
+    "rounds": 235,
+    "iterations": 10
+  },
+  "engine_mixed": {
+    "mean": 0.0044810313967741785,
+    "stddev": 0.000712490477703768,
+    "rounds": 252,
+    "iterations": 10
+  },
+  "engine_cpu": {
+    "mean": 0.0037397905441259676,
+    "stddev": 0.0001057529497100605,
+    "rounds": 272,
+    "iterations": 10
   }
 }

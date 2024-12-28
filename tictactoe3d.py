@@ -5,7 +5,8 @@ Supports arbitrary NxNxN board sizes with efficient bit-based representation
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import List, Set, Optional, Tuple, Union
+from typing import List, Set, Optional, Tuple, Union, Protocol, runtime_checkable
+from abc import ABC, abstractmethod
 import numpy as np
 import numpy.typing as npt
 from numba import cuda, uint64, int32, float32 # type: ignore
@@ -167,9 +168,47 @@ def check_pattern_match(board_bits: uint64[:], pattern_bits: uint64[:],  # type:
     return True
 
 @cuda.jit
+def evaluate_position_kernel(board_p1, board_p2, result, patterns,
+                           n_patterns: int32, n_u64s: int32): # type: ignore
+    """CUDA kernel for single position evaluation"""
+    if cuda.grid(1) > 0:  # Only use first thread
+        return
+    
+    # Check each pattern
+    for pattern_idx in range(n_patterns):
+        pattern_offset = pattern_idx * n_u64s
+        
+        # Check player 1 win
+        if check_pattern_match(
+            board_p1, 
+            patterns[pattern_offset:pattern_offset + n_u64s],
+            n_u64s
+        ):
+            result[0] = GameResult.WIN.value
+            return
+        
+        # Check player 2 win
+        if check_pattern_match(
+            board_p2,
+            patterns[pattern_offset:pattern_offset + n_u64s],
+            n_u64s
+        ):
+            result[0] = GameResult.LOSS.value
+            return
+    
+    # Check for draw
+    is_full = True
+    for u64_idx in range(n_u64s):
+        if (board_p1[u64_idx] | board_p2[u64_idx]) != ~np.uint64(0):
+            is_full = False
+            break
+    
+    result[0] = GameResult.DRAW.value if is_full else GameResult.IN_PROGRESS.value
+
+@cuda.jit
 def evaluate_boards_kernel(boards_p1, boards_p2, results, patterns, 
                          n_patterns: int32, n_u64s: int32): # type: ignore
-    """CUDA kernel for board evaluation"""
+    """CUDA kernel for batch position evaluation"""
     idx = cuda.grid(1)
     if idx >= boards_p1.shape[0]:
         return
@@ -205,8 +244,194 @@ def evaluate_boards_kernel(boards_p1, boards_p2, results, patterns,
     
     results[idx] = GameResult.DRAW.value if is_full else GameResult.IN_PROGRESS.value
 
-class TicTacToe3D:
-    """Main game class for arbitrary-sized 3D Tic-Tac-Toe"""
+@cuda.jit(device=True)
+def get_valid_moves_device(board_p1: uint64[:], board_p2: uint64[:],
+                          moves: int32[:], n_moves: int32[:],
+                          size: int32, num_u64s: int32) -> None:
+    """Device function to get valid moves"""
+    n_moves[0] = 0
+    total_positions = size * size * size
+    
+    for pos in range(total_positions):
+        array_idx = pos // 64
+        bit_idx = pos % 64
+        mask = np.uint64(1) << bit_idx
+        
+        if not ((board_p1[array_idx] & mask) or (board_p2[array_idx] & mask)):
+            idx = cuda.atomic.add(n_moves, 0, 1)
+            if idx < moves.shape[0]:
+                moves[idx] = pos
+
+@cuda.jit(device=True)
+def make_move_device(board: uint64[:], pos: int32, size: int32) -> None:
+    """Device function to make a move"""
+    array_idx = pos // 64
+    bit_idx = pos % 64
+    board[array_idx] |= np.uint64(1) << bit_idx
+
+@cuda.jit(device=True)
+def clear_move_device(board: uint64[:], pos: int32, size: int32) -> None:
+    """Device function to clear a move"""
+    array_idx = pos // 64
+    bit_idx = pos % 64
+    board[array_idx] &= ~(np.uint64(1) << bit_idx)
+
+@cuda.jit(device=True)
+def evaluate_heuristic_device(board_p1: uint64[:], board_p2: uint64[:],
+                            patterns: uint64[:], n_patterns: int32,
+                            num_u64s: int32) -> float32:
+    """Device function for heuristic evaluation"""
+    score = float32(0.0)
+    total_patterns = float32(n_patterns)
+    
+    for pattern_idx in range(n_patterns):
+        pattern_offset = pattern_idx * num_u64s
+        p1_match = float32(0.0)
+        p2_match = float32(0.0)
+        
+        for i in range(num_u64s):
+            pattern_bits = patterns[pattern_offset + i]
+            p1_match += float32(cuda.popc(board_p1[i] & pattern_bits))
+            p2_match += float32(cuda.popc(board_p2[i] & pattern_bits))
+        
+        score += (p1_match - p2_match) / total_patterns
+    
+    return score
+
+@cuda.jit(device=True)
+def minimax_device(board_p1: uint64[:], board_p2: uint64[:],
+                  patterns: uint64[:], n_patterns: int32,
+                  depth: int32, alpha: float32, beta: float32,
+                  maximizing: bool, size: int32, num_u64s: int32,
+                  best_move: int32[:], temp_board: uint64[:],
+                  moves: int32[:], n_moves: int32[:]) -> float32:
+    """Device implementation of minimax algorithm"""
+    # Check terminal states
+    result = float32(0.0)
+    is_terminal = False
+    
+    # Check each pattern for wins
+    for pattern_idx in range(n_patterns):
+        pattern_offset = pattern_idx * num_u64s
+        
+        # Check player 1 win
+        if check_pattern_match(board_p1, patterns[pattern_offset:pattern_offset + num_u64s], num_u64s):
+            return float32(1.0)
+        
+        # Check player 2 win
+        if check_pattern_match(board_p2, patterns[pattern_offset:pattern_offset + num_u64s], num_u64s):
+            return float32(-1.0)
+    
+    # Check for draw
+    is_full = True
+    for i in range(num_u64s):
+        if (board_p1[i] | board_p2[i]) != ~np.uint64(0):
+            is_full = False
+            break
+    
+    if is_full:
+        return float32(0.0)
+    elif depth == 0:
+        return evaluate_heuristic_device(board_p1, board_p2, patterns, n_patterns, num_u64s)
+    
+    # Get valid moves
+    get_valid_moves_device(board_p1, board_p2, moves, n_moves, size, num_u64s)
+    if n_moves[0] == 0:
+        return float32(0.0)
+    
+    # Copy current board state to temp board
+    for i in range(num_u64s):
+        temp_board[i] = board_p1[i] if maximizing else board_p2[i]
+    
+    if maximizing:
+        max_eval = float32(-1000.0)
+        for i in range(n_moves[0]):
+            move = moves[i]
+            make_move_device(temp_board, move, size)
+            
+            eval = minimax_device(temp_board, board_p2, patterns, n_patterns,
+                                depth - 1, alpha, beta, False,
+                                size, num_u64s, best_move, temp_board,
+                                moves, n_moves)
+            
+            clear_move_device(temp_board, move, size)
+            
+            if eval > max_eval:
+                max_eval = eval
+                if depth == best_move[1]:  # If at root
+                    best_move[0] = move
+            
+            alpha = max(alpha, eval)
+            if beta <= alpha:
+                break
+        
+        return max_eval
+    else:
+        min_eval = float32(1000.0)
+        for i in range(n_moves[0]):
+            move = moves[i]
+            make_move_device(temp_board, move, size)
+            
+            eval = minimax_device(board_p1, temp_board, patterns, n_patterns,
+                                depth - 1, alpha, beta, True,
+                                size, num_u64s, best_move, temp_board,
+                                moves, n_moves)
+            
+            clear_move_device(temp_board, move, size)
+            
+            if eval < min_eval:
+                min_eval = eval
+                if depth == best_move[1]:  # If at root
+                    best_move[0] = move
+            
+            beta = min(beta, eval)
+            if beta <= alpha:
+                break
+        
+        return min_eval
+
+@cuda.jit
+def find_best_move_kernel(board_p1: uint64[:], board_p2: uint64[:],
+                         patterns: uint64[:], best_move: int32[:],
+                         depth: int32, size: int32, num_u64s: int32,
+                         n_patterns: int32):
+    """Kernel to find the best move"""
+    if cuda.grid(1) > 0:  # Only use first thread
+        return
+    
+    # Allocate shared memory for temporary storage
+    temp_board = cuda.shared.array(shape=64, dtype=uint64)  # Adjust size as needed
+    moves = cuda.shared.array(shape=512, dtype=int32)  # Max possible moves
+    n_moves = cuda.shared.array(shape=1, dtype=int32)
+    
+    best_move[1] = depth  # Store original depth for root move tracking
+    minimax_device(board_p1, board_p2, patterns, n_patterns,
+                  depth, float32(-1000.0), float32(1000.0), True,
+                  size, num_u64s, best_move, temp_board,
+                  moves, n_moves)
+
+class TicTacToeEngine(ABC):
+    """Abstract base class for TicTacToe engines"""
+    
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Engine name"""
+        pass
+    
+    @abstractmethod
+    def evaluate_position(self, board_p1: BitBoard, board_p2: BitBoard) -> GameResult:
+        """Evaluate current position"""
+        pass
+    
+    @abstractmethod
+    def get_best_move(self, board_p1: BitBoard, board_p2: BitBoard, depth: int) -> Optional[Tuple[int, int, int]]:
+        """Get best move for current position"""
+        pass
+
+class CPUEngine(TicTacToeEngine):
+    """Pure CPU-based engine using numpy"""
+    name = "CPU Engine"
     
     def __init__(self, config: GameConfig):
         self.config = config
@@ -217,40 +442,216 @@ class TicTacToe3D:
         generator = WinPatternGenerator(config)
         self.patterns = generator.generate_all_patterns()
         
-        # Convert patterns to CUDA-friendly format
+        # Convert patterns to numpy array for efficient operations
+        self.pattern_array = np.zeros((len(self.patterns), self.num_u64s), dtype=np.uint64)
+        for i, pattern in enumerate(self.patterns):
+            self.pattern_array[i] = pattern.bits
+    
+    def evaluate_position(self, board_p1: BitBoard, board_p2: BitBoard) -> GameResult:
+        """Evaluate current position using numpy operations"""
+        # Check for wins using vectorized operations
+        p1_bits = board_p1.bits
+        p2_bits = board_p2.bits
+        
+        # Check player 1 win
+        for pattern_bits in self.pattern_array:
+            if np.all((p1_bits & pattern_bits) == pattern_bits):
+                return GameResult.WIN
+        
+        # Check player 2 win
+        for pattern_bits in self.pattern_array:
+            if np.all((p2_bits & pattern_bits) == pattern_bits):
+                return GameResult.LOSS
+        
+        # Check for draw
+        if np.all((p1_bits | p2_bits) == ~np.uint64(0)):
+            return GameResult.DRAW
+        
+        return GameResult.IN_PROGRESS
+    
+    def get_valid_moves(self, board_p1: BitBoard, board_p2: BitBoard) -> List[Tuple[int, int, int]]:
+        """Get list of valid moves using numpy operations"""
+        moves = []
+        combined_bits = board_p1.bits | board_p2.bits
+        
+        # Use numpy to find empty positions
+        for z in range(self.size):
+            for y in range(self.size):
+                for x in range(self.size):
+                    pos = x + y * self.size + z * self.size * self.size
+                    array_idx, bit_idx = pos // 64, pos % 64
+                    if not (combined_bits[array_idx] & (np.uint64(1) << bit_idx)):
+                        moves.append((x, y, z))
+        
+        return moves
+    
+    def minimax(self, board_p1: BitBoard, board_p2: BitBoard, depth: int,
+                alpha: float = float('-inf'), beta: float = float('inf'),
+                maximizing: bool = True) -> Tuple[float, Optional[Tuple[int, int, int]]]:
+        """Pure CPU minimax implementation"""
+        result = self.evaluate_position(board_p1, board_p2)
+        
+        if result == GameResult.WIN:
+            return 1.0, None
+        elif result == GameResult.LOSS:
+            return -1.0, None
+        elif result == GameResult.DRAW:
+            return 0.0, None
+        elif depth == 0:
+            # Simple heuristic based on pattern matching
+            score = 0.0
+            total_patterns = len(self.patterns)
+            
+            for pattern_bits in self.pattern_array:
+                p1_match = np.sum(np.bitwise_and(board_p1.bits, pattern_bits))
+                p2_match = np.sum(np.bitwise_and(board_p2.bits, pattern_bits))
+                score += (p1_match - p2_match) / total_patterns
+            
+            return score, None
+        
+        moves = self.get_valid_moves(board_p1, board_p2)
+        if not moves:
+            return 0.0, None
+        
+        # Create reusable BitBoard objects
+        temp_board = BitBoard(self.config)
+        best_move = None
+        
+        if maximizing:
+            max_eval = float('-inf')
+            for move in moves:
+                temp_board.bits[:] = board_p1.bits
+                temp_board.set_bit(*move)
+                
+                eval, _ = self.minimax(temp_board, board_p2, depth-1, alpha, beta, False)
+                
+                if eval > max_eval:
+                    max_eval = eval
+                    best_move = move
+                alpha = max(alpha, eval)
+                if beta <= alpha:
+                    break
+            return max_eval, best_move
+        else:
+            min_eval = float('inf')
+            for move in moves:
+                temp_board.bits[:] = board_p2.bits
+                temp_board.set_bit(*move)
+                
+                eval, _ = self.minimax(board_p1, temp_board, depth-1, alpha, beta, True)
+                
+                if eval < min_eval:
+                    min_eval = eval
+                    best_move = move
+                beta = min(beta, eval)
+                if beta <= alpha:
+                    break
+            return min_eval, best_move
+    
+    def get_best_move(self, board_p1: BitBoard, board_p2: BitBoard, depth: int) -> Optional[Tuple[int, int, int]]:
+        """Get best move using CPU-based minimax"""
+        _, move = self.minimax(board_p1, board_p2, depth)
+        return move
+
+class GPUEngine(TicTacToeEngine):
+    """Pure GPU-based engine using CUDA"""
+    name = "GPU Engine"
+    
+    def __init__(self, config: GameConfig):
+        self.config = config
+        self.size = config.size
+        self.num_u64s = config.num_u64s
+        
+        # Generate winning patterns
+        generator = WinPatternGenerator(config)
+        self.patterns = generator.generate_all_patterns()
+        
+        # Convert patterns to CUDA-friendly format and transfer to GPU
         pattern_array = np.zeros((len(self.patterns) * self.num_u64s), dtype=np.uint64)
         for i, pattern in enumerate(self.patterns):
             pattern_array[i * self.num_u64s:(i + 1) * self.num_u64s] = pattern.bits
         
-        # CUDA setup and optimization
+        # Create pinned memory and transfer patterns to GPU
+        self.pattern_array = cuda.pinned_array(pattern_array.shape, dtype=np.uint64)
+        self.pattern_array[:] = pattern_array
+        self.d_patterns = cuda.to_device(self.pattern_array)
+        
+        # Calculate optimal thread configuration
         device = cuda.get_current_device()
         self.max_threads_per_block = min(device.MAX_THREADS_PER_BLOCK, MAX_THREADS_PER_BLOCK)
         self.warp_size = WARP_SIZE
-        
-        # Calculate optimal thread count (multiple of warp size)
         self.threadsperblock = min(
             self.max_threads_per_block,
             ((self.max_threads_per_block // self.warp_size) * self.warp_size)
         )
         
-        # Create pinned memory for patterns
-        self.pattern_array = cuda.pinned_array(pattern_array.shape, dtype=np.uint64)
-        self.pattern_array[:] = pattern_array
-        self.d_patterns = cuda.to_device(self.pattern_array)
+    def evaluate_position(self, board_p1: BitBoard, board_p2: BitBoard) -> GameResult:
+        """Evaluate position using GPU"""
+        # Transfer boards to device
+        d_board_p1 = cuda.to_device(board_p1.bits)
+        d_board_p2 = cuda.to_device(board_p2.bits)
+        d_result = cuda.device_array(1, dtype=np.int32)
         
-        # Initialize empty boards for new game
-        self.board_p1 = BitBoard(config)
-        self.board_p2 = BitBoard(config)
-        self.current_player = 1
+        # Launch kernel
+        evaluate_position_kernel[1, 1](
+            d_board_p1, d_board_p2, d_result,
+            self.d_patterns, np.int32(len(self.patterns)), np.int32(self.num_u64s)
+        )
+        
+        return GameResult(d_result.copy_to_host()[0])
+    
+    def get_best_move(self, board_p1: BitBoard, board_p2: BitBoard, depth: int) -> Optional[Tuple[int, int, int]]:
+        """Get best move using GPU-accelerated minimax"""
+        # Allocate device memory for result
+        best_move = cuda.device_array(2, dtype=np.int32)  # [move, original_depth]
+        
+        # Launch kernel
+        find_best_move_kernel[1, 1](
+            cuda.to_device(board_p1.bits),
+            cuda.to_device(board_p2.bits),
+            self.d_patterns,
+            best_move,
+            np.int32(depth),
+            np.int32(self.size),
+            np.int32(self.num_u64s),
+            np.int32(len(self.patterns))
+        )
+        
+        # Get result
+        move_pos = best_move[0].copy_to_host()
+        if move_pos < 0:
+            return None
+        
+        # Convert position to coordinates
+        x = move_pos % self.size
+        y = (move_pos // self.size) % self.size
+        z = move_pos // (self.size * self.size)
+        return (x, y, z)
+
+class MixedEngine(TicTacToeEngine):
+    """Hybrid engine using both CPU and GPU"""
+    name = "Mixed Engine"
+    
+    def __init__(self, config: GameConfig):
+        self.config = config
+        self.size = config.size
+        self.num_u64s = config.num_u64s
+        
+        # Initialize both CPU and GPU components
+        self.cpu_engine = CPUEngine(config)
+        self.gpu_engine = GPUEngine(config)
+        
+        # Use GPU for pattern matching and position evaluation
+        self.patterns = self.gpu_engine.patterns
+        self.d_patterns = self.gpu_engine.d_patterns
         
         # Preallocate pinned memory for batch evaluation
-        self.max_batch_size = 1024  # Adjust based on your needs
+        self.max_batch_size = 1024
         self.h_boards_p1 = cuda.pinned_array((self.max_batch_size, self.num_u64s), dtype=np.uint64)
         self.h_boards_p2 = cuda.pinned_array((self.max_batch_size, self.num_u64s), dtype=np.uint64)
     
-    def evaluate_batch(self, boards_p1: List[BitBoard], 
-                      boards_p2: List[BitBoard]) -> npt.NDArray[np.int32]:
-        """Evaluate multiple board positions in parallel"""
+    def evaluate_batch(self, boards_p1: List[BitBoard], boards_p2: List[BitBoard]) -> npt.NDArray[np.int32]:
+        """Evaluate multiple positions in parallel using GPU"""
         n_boards = len(boards_p1)
         assert len(boards_p2) == n_boards, "Must provide equal number of boards"
         assert n_boards <= self.max_batch_size, f"Batch size {n_boards} exceeds maximum {self.max_batch_size}"
@@ -260,34 +661,129 @@ class TicTacToe3D:
             self.h_boards_p1[i] = boards_p1[i].bits
             self.h_boards_p2[i] = boards_p2[i].bits
         
-        # Transfer to device using pinned memory
+        # Transfer to device
         d_boards_p1 = cuda.to_device(self.h_boards_p1[:n_boards])
         d_boards_p2 = cuda.to_device(self.h_boards_p2[:n_boards])
         d_results = cuda.device_array(n_boards, dtype=np.int32)
         
-        # Calculate optimal grid size
-        min_grid_size = (n_boards + self.threadsperblock - 1) // self.threadsperblock
+        # Calculate grid size
+        min_grid_size = (n_boards + self.gpu_engine.threadsperblock - 1) // self.gpu_engine.threadsperblock
         device = cuda.get_current_device()
         max_blocks = device.MULTIPROCESSOR_COUNT * MIN_BLOCKS_PER_SM
         blockspergrid = max(min_grid_size, max_blocks)
         
         # Launch kernel
-        evaluate_boards_kernel[blockspergrid, self.threadsperblock](
+        evaluate_boards_kernel[blockspergrid, self.gpu_engine.threadsperblock](
             d_boards_p1, d_boards_p2, d_results,
             self.d_patterns, np.int32(len(self.patterns)), np.int32(self.num_u64s)
         )
         
         return d_results.copy_to_host()
 
+    def evaluate_position(self, board_p1: BitBoard, board_p2: BitBoard) -> GameResult:
+        """Evaluate single position using GPU"""
+        return self.gpu_engine.evaluate_position(board_p1, board_p2)
+
     def get_valid_moves(self, board_p1: BitBoard, board_p2: BitBoard) -> List[Tuple[int, int, int]]:
-        """Get list of valid moves"""
-        moves = []
-        for z in range(self.size):
-            for y in range(self.size):
-                for x in range(self.size):
-                    if not (board_p1.get_bit(x, y, z) or board_p2.get_bit(x, y, z)):
-                        moves.append((x, y, z))
-        return moves
+        """Get valid moves using CPU"""
+        return self.cpu_engine.get_valid_moves(board_p1, board_p2)
+    
+    def minimax(self, board_p1: BitBoard, board_p2: BitBoard, depth: int,
+                alpha: float = float('-inf'), beta: float = float('inf'),
+                maximizing: bool = True) -> Tuple[float, Optional[Tuple[int, int, int]]]:
+        """Hybrid minimax using GPU for evaluation and CPU for search"""
+        result = self.evaluate_position(board_p1, board_p2)
+        
+        if result == GameResult.WIN:
+            return 1.0, None
+        elif result == GameResult.LOSS:
+            return -1.0, None
+        elif result == GameResult.DRAW:
+            return 0.0, None
+        elif depth == 0:
+            # Use GPU-accelerated batch evaluation for heuristic
+            boards_p1 = [board_p1] * len(self.patterns)
+            boards_p2 = [board_p2] * len(self.patterns)
+            pattern_scores = self.evaluate_batch(boards_p1, boards_p2)
+            return float(np.mean(pattern_scores)), None
+        
+        moves = self.get_valid_moves(board_p1, board_p2)
+        if not moves:
+            return 0.0, None
+        
+        # Create reusable BitBoard objects
+        temp_board = BitBoard(self.config)
+        best_move = None
+        
+        # Simple move ordering heuristic
+        mid = self.size // 2
+        moves.sort(key=lambda m: -(abs(m[0] - mid) + abs(m[1] - mid) + abs(m[2] - mid)))
+        
+        if maximizing:
+            max_eval = float('-inf')
+            for move in moves:
+                temp_board.bits[:] = board_p1.bits
+                temp_board.set_bit(*move)
+                
+                eval, _ = self.minimax(temp_board, board_p2, depth-1, alpha, beta, False)
+                
+                if eval > max_eval:
+                    max_eval = eval
+                    best_move = move
+                alpha = max(alpha, eval)
+                if beta <= alpha:
+                    break
+            return max_eval, best_move
+        else:
+            min_eval = float('inf')
+            for move in moves:
+                temp_board.bits[:] = board_p2.bits
+                temp_board.set_bit(*move)
+                
+                eval, _ = self.minimax(board_p1, temp_board, depth-1, alpha, beta, True)
+                
+                if eval < min_eval:
+                    min_eval = eval
+                    best_move = move
+                beta = min(beta, eval)
+                if beta <= alpha:
+                    break
+            return min_eval, best_move
+    
+    def get_best_move(self, board_p1: BitBoard, board_p2: BitBoard, depth: int) -> Optional[Tuple[int, int, int]]:
+        """Get best move using hybrid approach"""
+        _, move = self.minimax(board_p1, board_p2, depth)
+        return move
+
+class TicTacToe3D:
+    """Main game class for arbitrary-sized 3D Tic-Tac-Toe"""
+    
+    def __init__(self, config: GameConfig, engine_type: str = "mixed"):
+        self.config = config
+        self.size = config.size
+        self.num_u64s = config.num_u64s
+        
+        # Initialize game state
+        self.board_p1 = BitBoard(config)
+        self.board_p2 = BitBoard(config)
+        self.current_player = 1
+        
+        # Create engine based on type
+        if engine_type.lower() == "cpu":
+            self._engine = CPUEngine(config)
+        elif engine_type.lower() == "gpu":
+            self._engine = GPUEngine(config)
+        else:
+            self._engine = MixedEngine(config)
+    
+    @property
+    def engine(self) -> TicTacToeEngine:
+        """Get the current engine"""
+        return self._engine
+    
+    def get_game_state(self) -> GameResult:
+        """Get current game state"""
+        return self.engine.evaluate_position(self.board_p1, self.board_p2)
     
     def make_move(self, x: int, y: int, z: int) -> bool:
         """Make a move at the specified position"""
@@ -307,90 +803,9 @@ class TicTacToe3D:
         self.current_player = 3 - self.current_player  # Switch players (1->2 or 2->1)
         return True
     
-    def get_game_state(self) -> GameResult:
-        """Get current game state"""
-        result = self.evaluate_batch([self.board_p1], [self.board_p2])[0]
-        return GameResult(result)
-    
-    def heuristic(self, board_p1: BitBoard, board_p2: BitBoard) -> float:
-        """Heuristic evaluation function"""
-        # Use CUDA-accelerated batch evaluation for patterns
-        boards_p1 = [board_p1] * len(self.patterns)
-        boards_p2 = [board_p2] * len(self.patterns)
-        
-        # Evaluate all patterns at once
-        pattern_scores = self.evaluate_batch(boards_p1, boards_p2)
-        return float(np.mean(pattern_scores))
-    
-    def minimax(self, board_p1: BitBoard, board_p2: BitBoard, depth: int,
-                alpha: float = float('-inf'), beta: float = float('inf'),
-                maximizing: bool = True) -> Tuple[float, Optional[Tuple[int, int, int]]]:
-        """Minimax algorithm with alpha-beta pruning"""
-        result = self.evaluate_batch([board_p1], [board_p2])[0]
-        
-        if result == GameResult.WIN.value:
-            return 1.0, None
-        elif result == GameResult.LOSS.value:
-            return -1.0, None
-        elif result == GameResult.DRAW.value:
-            return 0.0, None
-        elif depth == 0:
-            return self.heuristic(board_p1, board_p2), None
-        
-        moves = self.get_valid_moves(board_p1, board_p2)
-        if not moves:
-            return 0.0, None
-        
-        # Create reusable BitBoard objects for move simulation
-        temp_board = BitBoard(self.config)
-        best_move = None
-        
-        # Simple move ordering heuristic - center and middle layers first
-        mid = self.size // 2
-        moves.sort(key=lambda m: -(abs(m[0] - mid) + abs(m[1] - mid) + abs(m[2] - mid)))
-        
-        if maximizing:
-            max_eval = float('-inf')
-            for move in moves:
-                # Reuse BitBoard object and copy bits
-                temp_board.bits[:] = board_p1.bits
-                temp_board.set_bit(*move)
-                
-                eval, _ = self.minimax(temp_board, board_p2, depth-1, alpha, beta, False)
-                
-                if eval > max_eval:
-                    max_eval = eval
-                    best_move = move
-                alpha = max(alpha, eval)
-                if beta <= alpha:
-                    break
-            return max_eval, best_move
-        else:
-            min_eval = float('inf')
-            for move in moves:
-                # Reuse BitBoard object and copy bits
-                temp_board.bits[:] = board_p2.bits
-                temp_board.set_bit(*move)
-                
-                eval, _ = self.minimax(board_p1, temp_board, depth-1, alpha, beta, True)
-                
-                if eval < min_eval:
-                    min_eval = eval
-                    best_move = move
-                beta = min(beta, eval)
-                if beta <= alpha:
-                    break
-            return min_eval, best_move
-    
     def get_best_move(self, depth: int = 4) -> Optional[Tuple[int, int, int]]:
-        """Get best move using minimax with parallel evaluation"""
-        moves = self.get_valid_moves(self.board_p1, self.board_p2)
-        if not moves:
-            return None
-            
-        # Always use minimax for move selection
-        _, move = self.minimax(self.board_p1, self.board_p2, depth)
-        return move
+        """Get best move using selected engine"""
+        return self.engine.get_best_move(self.board_p1, self.board_p2, depth)
     
     def print_board(self) -> None:
         """Print current board state"""
@@ -460,11 +875,83 @@ def main():
     parser.add_argument('--moves', type=int, default=None, help='Number of moves to profile (default: unlimited)')
     parser.add_argument('--size', type=int, default=3, help='Board size (default: 3)')
     parser.add_argument('--target', type=int, default=3, help='Target in a row to win (default: 3)')
+    parser.add_argument('--engine', type=str, choices=['cpu', 'gpu', 'mixed'], default='mixed',
+                       help='Engine type to use (default: mixed)')
+    parser.add_argument('--benchmark', action='store_true', help='Run engine benchmarks')
     args = parser.parse_args()
 
     # Create game instance
     config = GameConfig(size=args.size, target=args.target)
-    game = TicTacToe3D(config)
+    
+    if args.benchmark:
+        # Run benchmarks for all engines
+        engines = ['cpu', 'gpu', 'mixed']
+        results = {}
+        
+        print("\nRunning engine benchmarks...")
+        print("=" * 50)
+        
+        for engine_type in engines:
+            print(f"\nTesting {engine_type.upper()} engine:")
+            game = TicTacToe3D(config, engine_type=engine_type)
+            
+            # Measure move generation time
+            move_times = []
+            eval_times = []
+            
+            # Warm up
+            for _ in range(3):
+                game.get_best_move(depth=args.depth)
+            
+            # Actual benchmark
+            n_trials = 5
+            for i in range(n_trials):
+                # Measure move generation
+                move_start = time.time()
+                move = game.get_best_move(depth=args.depth)
+                move_time = time.time() - move_start
+                move_times.append(move_time)
+                
+                if move:
+                    game.make_move(*move)
+                
+                # Measure position evaluation
+                eval_start = time.time()
+                game.get_game_state()
+                eval_time = time.time() - eval_start
+                eval_times.append(eval_time)
+            
+            # Store results
+            results[engine_type] = {
+                'move_time': mean(move_times),
+                'eval_time': mean(eval_times)
+            }
+            
+            print(f"Average move time: {results[engine_type]['move_time']*1000:.2f}ms")
+            print(f"Average eval time: {results[engine_type]['eval_time']*1000:.2f}ms")
+        
+        # Print comparison
+        print("\nEngine Comparison:")
+        print("=" * 50)
+        fastest_move = min(results.items(), key=lambda x: x[1]['move_time'])[0]
+        fastest_eval = min(results.items(), key=lambda x: x[1]['eval_time'])[0]
+        
+        print("\nMove Generation Speed:")
+        baseline_move = results[fastest_move]['move_time']
+        for engine, data in results.items():
+            speedup = data['move_time'] / baseline_move
+            print(f"{engine.upper():6s}: {data['move_time']*1000:8.2f}ms ({speedup:6.2f}x)")
+        
+        print("\nPosition Evaluation Speed:")
+        baseline_eval = results[fastest_eval]['eval_time']
+        for engine, data in results.items():
+            speedup = data['eval_time'] / baseline_eval
+            print(f"{engine.upper():6s}: {data['eval_time']*1000:8.2f}ms ({speedup:6.2f}x)")
+        
+        return
+    
+    # Regular game play
+    game = TicTacToe3D(config, engine_type=args.engine)
     
     # Performance tracking
     move_times: deque = deque(maxlen=100)
@@ -492,7 +979,7 @@ def main():
                 break
                 
             # Update board display
-            layout["board"].update(Panel(create_board_table(game), title="3D Tic-Tac-Toe"))
+            layout["board"].update(Panel(create_board_table(game), title=f"3D Tic-Tac-Toe ({game.engine.name})"))
             
             # Get game state and track evaluation time
             eval_start = time.time()
