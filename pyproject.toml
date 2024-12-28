@@ -1,0 +1,17 @@
+[project]
+name = "tictactoe"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numba>=0.60.0",
+    "numpy>=2.0.2",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "hypothesis>=6.123.2",
+    "pytest>=8.3.4",
+    "pytest-benchmark>=5.1.0",
+]
