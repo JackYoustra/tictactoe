@@ -291,7 +291,7 @@ class TestPerformance:
             for b1, b2 in zip(boards_p1, boards_p2):
                 game.board_p1 = b1
                 game.board_p2 = b2
-                moves.append(game.get_best_move(depth=3))
+                moves.append(game.get_best_move(depth=5))
             return moves
         
         # Run performance test

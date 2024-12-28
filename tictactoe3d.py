@@ -516,7 +516,7 @@ def create_stats_panel(moves_per_sec: float, evals_per_sec: float,
 def main():
     """Self-playing game with performance metrics"""
     # Create a 4x4x4 game where you need 4 in a row to win
-    config = GameConfig(size=4, target=4)
+    config = GameConfig(size=3, target=3)
     game = TicTacToe3D(config)
     
     # Performance tracking
@@ -566,7 +566,7 @@ def main():
             
             # Get and make AI move
             move_start = time.time()
-            move = game.get_best_move(depth=3)
+            move = game.get_best_move(depth=10)
             move_time = time.time() - move_start
             move_times.append(move_time)
             total_moves += 1
